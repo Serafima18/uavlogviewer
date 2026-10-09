@@ -59,6 +59,11 @@ class LogProcessor:
             timestamps['TimeUS'] = msg.TimeUS / 1e6
             timestamps['TimeUS_raw'] = int(msg.TimeUS)
 
+        # TimeUS храним в миллисекундах
+        elif hasattr(msg, 'TimeMS'):
+            timestamps['TimeUS'] = msg.TimeMS / 1000.0
+            timestamps['TimeUS_raw'] = int(msg.TimeMS * 1000)
+
         # GPS-время в логе задано через GPS week + milliseconds.
         if hasattr(msg, 'GMS') and hasattr(msg, 'GWk'):
             gps_time = self._gps_to_seconds(msg.GWk, msg.GMS)
@@ -84,7 +89,7 @@ class LogProcessor:
         """Преобразует MAVLink-сообщение в словарь без временных полей."""
         result = {}
         for field in msg.get_fieldnames():
-            if field not in ['TimeUS', 'GMS', 'GWk']:
+            if field not in ['TimeUS', 'TimeMS', 'GMS', 'GWk']:
                 result[field] = getattr(msg, field, None)
         return result
 

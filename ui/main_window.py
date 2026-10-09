@@ -66,6 +66,11 @@ class MainWindow(QMainWindow):
         self.current_time_type = self.plot_widget.time_type_combo.currentText()
         main_layout.addWidget(self.plot_widget)
 
+        # Графики располагаются в основном окне. Их можно менять в размерах,
+        # перемещать за заголовки и выносить отдельно двойным щелчком.
+        self.setDockNestingEnabled(True)
+        self.setDockOptions(QMainWindow.AllowNestedDocks | QMainWindow.AllowTabbedDocks)
+
         # Боковые/нижние панели.
         self.create_parameter_dock()
         self.create_cursor_info_dock()
@@ -83,6 +88,11 @@ class MainWindow(QMainWindow):
         # Меню и панель инструментов.
         self.create_menu()
         self.create_toolbar()
+        layout_menu = self.menuBar().addMenu('Расположение графиков')
+        layout_menu.addAction('Показать все графики', self.plot_widget.show_all_graphs)
+        layout_menu.addAction('Восстановить сетку', self.plot_widget.reset_graph_layout)
+        layout_menu.addAction('Объединить графики', self.plot_widget.merge_graphs_dialog)
+        layout_menu.addAction('Разделить графики', self.plot_widget.split_graphs_dialog)
 
         self.status_bar.showMessage('Готов к работе. Выберите файл лога для анализа.')
 

@@ -1,9 +1,12 @@
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-                             QPushButton, QLabel, QComboBox, QLineEdit, QMessageBox)
-from PyQt5.QtCore import QPointF, Qt, QTimer, pyqtSignal
+                             QPushButton, QLabel, QComboBox, QLineEdit, QMessageBox,
+                             QMainWindow, QDockWidget, QMenu, QAction, QInputDialog,
+                             QSplitter, QFrame, QDialog, QApplication, QListWidget, QListWidgetItem, QDialogButtonBox, QAbstractItemView)
+from PyQt5.QtCore import QPointF, Qt, QTimer, pyqtSignal, QMimeData
 from datetime import datetime, timezone
 import pyqtgraph as pg
 import numpy as np
+from PyQt5.QtGui import QDrag
 
 
 # Вспомогательные оси и ViewBox
@@ -98,6 +101,83 @@ class CellViewBox(pg.ViewBox):
 # Основной виджет графиков
 
 
+class GraphHeader(QLabel):
+    """Перетаскивание заголовка меняет местами графики в сетке."""
+    def __init__(self, name, owner):
+        super().__init__(name)
+        self.name = name
+        self.owner = owner
+        self._start = None
+        self.setStyleSheet('font-weight: bold; padding: 5px; background: #e8edf3;')
+        self.setCursor(Qt.OpenHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._start = event.pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._start is not None and (event.pos() - self._start).manhattanLength() > QApplication.startDragDistance():
+            drag = QDrag(self)
+            mime = QMimeData()
+            mime.setData('application/x-uav-graph', self.name.encode('utf-8'))
+            drag.setMimeData(mime)
+            drag.exec_(Qt.MoveAction)
+            self._start = None
+
+    def mouseReleaseEvent(self, event):
+        self._start = None
+        super().mouseReleaseEvent(event)
+
+
+class GraphPanel(QFrame):
+    """Панель внутри главного окна, принимающая перетаскивание графика."""
+    def __init__(self, name, owner, plot):
+        super().__init__()
+        self.name = name
+        self.owner = owner
+        self.setAcceptDrops(True)
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setMinimumSize(120, 90)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(1)
+        bar = QHBoxLayout()
+        bar.addWidget(GraphHeader(name, owner), 1)
+        detach = QPushButton('↗')
+        detach.setToolTip('Вынести график в отдельное окно')
+        detach.setFixedWidth(28)
+        detach.clicked.connect(lambda: owner._detach_graph(name))
+        bar.addWidget(detach)
+        layout.addLayout(bar)
+        layout.addWidget(plot, 1)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat('application/x-uav-graph'):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        source = bytes(event.mimeData().data('application/x-uav-graph')).decode('utf-8')
+        self.owner._swap_graphs(source, self.name)
+        event.acceptProposedAction()
+
+
+class GraphWindow(QDialog):
+    """Отдельное окно только после явного открепления пользователем."""
+    def __init__(self, name, owner, plot):
+        super().__init__(owner.window())
+        self.name = name
+        self.owner = owner
+        self.setWindowTitle(name)
+        self.resize(760, 460)
+        layout = QVBoxLayout(self)
+        layout.addWidget(plot)
+
+    def closeEvent(self, event):
+        self.owner._attach_graph(self.name)
+        super().closeEvent(event)
+
+
 class PlotWidget(QWidget):
     time_type_changed = pyqtSignal(str)
     cursor_position_changed = pyqtSignal(float, dict)
@@ -123,7 +203,7 @@ class PlotWidget(QWidget):
         self.master_view_box = None
 
         # Режим отображения: одна общая область или отдельные ячейки.
-        self.display_mode = 'cells'
+        self.display_mode = 'dock'
         self.common_plot_widget = None
         self.common_plot_item = None
         self.common_view_box = None
@@ -159,6 +239,16 @@ class PlotWidget(QWidget):
         self.export_start_line = None
         self.export_end_line = None
 
+        # Dock-конструктор: одна панель может содержать несколько параметров.
+        self.dock_panels = {}  # имя -> GraphPanel
+        self.dock_host = None
+        self.graph_order = []
+        self.floating_graphs = {}
+        self._split_rows = []
+        self.graph_groups = {}       # имя параметра -> идентификатор панели
+        self.group_widgets = {}      # идентификатор -> общий PlotWidget
+        self.group_curves = {}       # идентификатор -> копии кривых
+        self._panel_plots = {}       # идентификатор -> виджет панели
         self.init_ui()
 
     # Создание интерфейса
@@ -178,7 +268,7 @@ class PlotWidget(QWidget):
         self.active_plot_combo.currentTextChanged.connect(self.on_active_plot_combo_changed)
 
         self.display_mode_combo = QComboBox()
-        self.display_mode_combo.addItems(['В одной области', 'По ячейкам'])
+        self.display_mode_combo.addItems(['По ячейкам', 'В одной области'])
         self.display_mode_combo.setCurrentText('По ячейкам')
         self.display_mode_combo.currentTextChanged.connect(self.on_display_mode_changed)
 
@@ -202,6 +292,12 @@ class PlotWidget(QWidget):
         control_layout.addWidget(self.active_plot_combo)
         control_layout.addWidget(QLabel('Отображение:'))
         control_layout.addWidget(self.display_mode_combo)
+        self.group_btn = QPushButton('Объединить графики')
+        self.group_btn.clicked.connect(self.merge_graphs_dialog)
+        control_layout.addWidget(self.group_btn)
+        self.ungroup_btn = QPushButton('Разделить графики')
+        self.ungroup_btn.clicked.connect(self.split_graphs_dialog)
+        control_layout.addWidget(self.ungroup_btn)
         control_layout.addWidget(self.color_btn)
         control_layout.addWidget(self.reset_all_btn)
         control_layout.addWidget(self.reset_active_btn)
@@ -214,7 +310,13 @@ class PlotWidget(QWidget):
         self.grid_layout = QGridLayout(self.grid_container)
         self.grid_layout.setContentsMargins(0, 0, 0, 0)
         self.grid_layout.setSpacing(6)
-        layout.addWidget(self.grid_container)
+        layout.addWidget(self.grid_container, 1)
+        self.grid_container.hide()
+
+        # QSplitter — настоящая внутренняя область, не создающая отдельных окон.
+        self.dock_host = QSplitter(Qt.Vertical, self)
+        self.dock_host.setChildrenCollapsible(False)
+        layout.addWidget(self.dock_host, 1)
 
         # Панель масштабирования отображения.
         scale_layout = QHBoxLayout()
@@ -276,11 +378,13 @@ class PlotWidget(QWidget):
 
     def _is_cell_mode(self):
         """Проверяет, включён ли режим отдельных ячеек."""
-        return self.display_mode == 'cells'
+        return self.display_mode in ('cells', 'dock')
 
     def on_display_mode_changed(self, text):
-        """Переключает отображение между общей областью и отдельными ячейками."""
-        self.display_mode = 'single' if text == 'В одной области' else 'cells'
+        """Ячейки сразу редактируются мышью в главном окне."""
+        self.display_mode = 'single' if text == 'В одной области' else 'dock'
+        self.grid_container.setVisible(self.display_mode == 'single')
+        self.dock_host.setVisible(self.display_mode == 'dock')
         self._rebuild_plot_layout()
         self.reset_all_plots()
 
@@ -400,6 +504,10 @@ class PlotWidget(QWidget):
         """Перестраивает область графиков под выбранный режим отображения."""
         self._detach_plot_items()
         self._clear_grid_layout()
+        if self.display_mode == 'single':
+            for window in list(self.floating_graphs.values()):
+                window.close()
+            self._release_dock_widgets()
 
         if self._is_cell_mode():
             self._clear_common_right_axes()
@@ -434,7 +542,12 @@ class PlotWidget(QWidget):
             self.export_preview_line = next(iter(self.export_preview_lines.values()), None)
             self.export_start_line = next(iter(self.export_start_lines.values()), None)
             self.export_end_line = next(iter(self.export_end_lines.values()), None)
-            self._rebuild_grid()
+            if self.display_mode == 'dock':
+                self._sync_dock_panels()
+                self._sync_x_links()
+                self._update_axis_labels()
+            else:
+                self._rebuild_grid()
         else:
             self._create_common_plot()
             self.grid_layout.addWidget(self.common_plot_widget, 0, 0)
@@ -468,6 +581,225 @@ class PlotWidget(QWidget):
         if self.active_plot in self.curves:
             self.set_active_plot(self.active_plot)
         self._update_export_lines()
+
+    def _release_dock_widgets(self):
+        """Освобождает PlotWidget перед сменой режима, не удаляя графики."""
+        self._clear_splitters()
+
+    def _group_of(self, name):
+        return self.graph_groups.get(name, name)
+
+    def _members(self, group):
+        return [name for name in self.graph_order
+                if name in self.plot_data and self._group_of(name) == group]
+
+    def _clear_splitters(self):
+        # Извлекаем PlotWidget до удаления GraphPanel: иначе Qt удалит графики.
+        for key, panel in list(self.dock_panels.items()):
+            plot = self._panel_plots.get(key)
+            if plot is not None and key not in self.floating_graphs:
+                plot.setParent(None)
+            panel.setParent(None)
+            panel.deleteLater()
+        self.dock_panels.clear()
+        self._panel_plots.clear()
+        while self.dock_host.count():
+            child = self.dock_host.widget(0)
+            child.setParent(None)
+            child.deleteLater()
+        self._split_rows.clear()
+
+    def _get_group_plot(self, group, members):
+        if len(members) == 1:
+            return self.plot_widgets[members[0]]
+        widget = self.group_widgets.get(group)
+        if widget is None:
+            widget = pg.PlotWidget(viewBox=CellViewBox())
+            widget.setBackground('w')
+            widget.showGrid(x=True, y=True, alpha=0.3)
+            widget.setLabel('bottom', 'Время')
+            widget.addLegend()
+            self.group_widgets[group] = widget
+            self.group_curves[group] = {}
+        for name, item in list(self.group_curves[group].items()):
+            if name not in members:
+                widget.removeItem(item)
+                del self.group_curves[group][name]
+        for name in members:
+            data = self.plot_data[name]
+            if name not in self.group_curves[group]:
+                self.group_curves[group][name] = widget.plot(
+                    data['x_display'], data['y_display'],
+                    pen=pg.mkPen(self.plot_colors[name], width=2), name=name)
+            else:
+                self.group_curves[group][name].setData(
+                    data['x_display'], data['y_display'])
+                self.group_curves[group][name].setPen(
+                    pg.mkPen(self.plot_colors[name], width=2))
+        widget.enableAutoRange()
+        return widget
+
+    def _sync_dock_panels(self):
+        """Создаёт по одной панели на группу, сохраняя обычные размеры при отсутствии изменений."""
+        names = list(self.plot_data)
+        self.graph_order = [n for n in self.graph_order if n in names]
+        self.graph_order.extend(n for n in names if n not in self.graph_order)
+        groups = []
+        for name in self.graph_order:
+            group = self._group_of(name)
+            if group not in groups and group not in self.floating_graphs:
+                groups.append(group)
+        if list(self.dock_panels) == groups:
+            return
+        self._clear_splitters()
+        if not groups:
+            return
+        import math
+        cols = max(1, math.ceil(math.sqrt(len(groups))))
+        for start in range(0, len(groups), cols):
+            row = QSplitter(Qt.Horizontal, self.dock_host)
+            row.setChildrenCollapsible(False)
+            self.dock_host.addWidget(row)
+            self._split_rows.append(row)
+            for group in groups[start:start + cols]:
+                members = self._members(group)
+                plot = self._get_group_plot(group, members)
+                panel = GraphPanel(group, self, plot)
+                panel.findChild(GraphHeader).setText(' + '.join(members))
+                row.addWidget(panel)
+                self.dock_panels[group] = panel
+                self._panel_plots[group] = plot
+        self.dock_host.setSizes([1] * self.dock_host.count())
+
+    def _swap_graphs(self, source, target):
+        if source == target:
+            return
+        a = self._members(source)
+        b = self._members(target)
+        if not a or not b:
+            return
+        indices = [self.graph_order.index(n) for n in a + b]
+        positions = sorted(indices)
+        sequence = b + a if min(self.graph_order.index(n) for n in a) < min(self.graph_order.index(n) for n in b) else a + b
+        for pos, name in zip(positions, sequence):
+            self.graph_order[pos] = name
+        self._clear_splitters()
+        self._sync_dock_panels()
+
+    def _detach_graph(self, group):
+        if group in self.floating_graphs or group not in self.dock_panels:
+            return
+        plot = self._panel_plots[group]
+        plot.setParent(None)
+        window = GraphWindow(' + '.join(self._members(group)), self, plot)
+        window.name = group
+        self.floating_graphs[group] = window
+        self._clear_splitters()
+        self._sync_dock_panels()
+        window.show()
+
+    def _attach_graph(self, group):
+        window = self.floating_graphs.pop(group, None)
+        if window is None:
+            return
+        plot = self.group_widgets.get(group)
+        if plot is None and group in self.plot_widgets:
+            plot = self.plot_widgets[group]
+        if plot is not None:
+            plot.setParent(None)
+        self._clear_splitters()
+        self._sync_dock_panels()
+
+    def show_all_graphs(self):
+        for window in self.floating_graphs.values():
+            window.show()
+            window.raise_()
+
+    def reset_graph_layout(self):
+        for window in list(self.floating_graphs.values()):
+            window.close()
+        self.graph_order = list(self.plot_data)
+        self._clear_splitters()
+        if self.display_mode == 'dock':
+            self._sync_dock_panels()
+
+    def merge_graphs_dialog(self):
+        """Выбрать произвольные 2–N кривых и поместить их в одну панель."""
+        if len(self.plot_data) < 2:
+            QMessageBox.information(self, 'Объединение', 'Добавьте хотя бы два графика.')
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Объединить графики')
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel('Выберите 2 или больше параметров (Ctrl или Shift):'))
+        listing = QListWidget(dialog)
+        listing.setSelectionMode(QAbstractItemView.MultiSelection)
+        for name in self.graph_order:
+            if name in self.plot_data:
+                listing.addItem(name)
+        layout.addWidget(listing)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        selected = [item.text() for item in listing.selectedItems()]
+        if len(selected) < 2:
+            QMessageBox.warning(self, 'Объединение', 'Выберите не менее двух параметров.')
+            return
+        group = self._group_of(selected[0])
+        # Если один из выбранных параметров уже в группе, переносим всю его группу.
+        affected = {self._group_of(n) for n in selected}
+        for name in list(self.plot_data):
+            if self._group_of(name) in affected:
+                self.graph_groups[name] = group
+        self._refresh_group_layout()
+
+    def split_graphs_dialog(self):
+        groups = {}
+        for name in self.plot_data:
+            groups.setdefault(self._group_of(name), []).append(name)
+        choices = [name for names in groups.values() if len(names) > 1 for name in names]
+        if not choices:
+            QMessageBox.information(self, 'Разделение', 'Нет объединённых графиков.')
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Разделить графики')
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel('Выберите параметры, которые нужно отделить:'))
+        listing = QListWidget(dialog)
+        listing.setSelectionMode(QAbstractItemView.MultiSelection)
+        listing.addItems(choices)
+        layout.addWidget(listing)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        selected = [item.text() for item in listing.selectedItems()]
+        # Выделяем оставшимся членам группы стабильный идентификатор.
+        for name in selected:
+            self.graph_groups[name] = name
+        self._normalize_groups()
+        self._refresh_group_layout()
+
+    def _normalize_groups(self):
+        groups = {}
+        for name in self.plot_data:
+            groups.setdefault(self._group_of(name), []).append(name)
+        for key, members in groups.items():
+            if key not in members:
+                for name in members:
+                    self.graph_groups[name] = members[0]
+
+    def _refresh_group_layout(self):
+        for window in list(self.floating_graphs.values()):
+            window.close()
+        self._clear_splitters()
+        if self.display_mode == 'dock':
+            self._sync_dock_panels()
 
     def _get_grid_shape(self, count):
         """Возвращает размеры сетки по количеству графиков."""
@@ -732,6 +1064,9 @@ class PlotWidget(QWidget):
         if curve is not None:
             curve.setData(data['x_display'], data['y_display'])
 
+        for group, curves in self.group_curves.items():
+            if parameter_name in curves:
+                curves[parameter_name].setData(data['x_display'], data['y_display'])
         self._refresh_axis(parameter_name)
         self._update_bottom_axis_label()
         self.update_gps_date_label()
@@ -1010,9 +1345,6 @@ class PlotWidget(QWidget):
         if parameter_name in self.curves:
             self.remove_plot(parameter_name)
 
-        if len(self.curves) >= 9:
-            QMessageBox.information(self, 'Информация', 'Одновременно можно отображать не больше 9 графиков')
-            return False
 
         x_arr = np.asarray(x_data, dtype=float)
         y_arr = np.asarray(y_data, dtype=float)
@@ -1072,6 +1404,13 @@ class PlotWidget(QWidget):
                     except Exception:
                         pass
 
+        self.graph_groups.pop(parameter_name, None)
+        for group, curves in self.group_curves.items():
+            if parameter_name in curves:
+                widget = self.group_widgets.get(group)
+                if widget is not None:
+                    widget.removeItem(curves[parameter_name])
+                del curves[parameter_name]
         self.plot_data.pop(parameter_name, None)
         self.plot_colors.pop(parameter_name, None)
         common_axis = self.common_right_axes.pop(parameter_name, None)
@@ -1081,6 +1420,12 @@ class PlotWidget(QWidget):
             except Exception:
                 pass
 
+        if parameter_name in self.floating_graphs:
+            self.floating_graphs[parameter_name].close()
+        if parameter_name in self.dock_panels:
+            self._clear_splitters()
+        if parameter_name in self.graph_order:
+            self.graph_order.remove(parameter_name)
         self._delete_plot_cell(parameter_name)
 
         index = self.active_plot_combo.findText(parameter_name)
@@ -1095,6 +1440,7 @@ class PlotWidget(QWidget):
                 self.color_btn.setEnabled(False)
                 self.reset_active_btn.setEnabled(False)
 
+        self._normalize_groups()
         self._rebuild_plot_layout()
         self._update_bottom_axis_label()
         self.update_gps_date_label()
@@ -1107,6 +1453,9 @@ class PlotWidget(QWidget):
             self.remove_plot(name)
 
         self._clear_common_right_axes()
+        self.graph_groups.clear()
+        self.group_curves.clear()
+        self.group_widgets.clear()
         self.plot_data.clear()
         self.plot_colors.clear()
         self.active_plot_combo.clear()
@@ -1191,6 +1540,9 @@ class PlotWidget(QWidget):
             common_axis.setPen(pg.mkPen(color, width=width))
             common_axis.setTextPen(pg.mkPen(color, width=width))
 
+        for curves in self.group_curves.values():
+            if parameter_name in curves:
+                curves[parameter_name].setPen(pg.mkPen(color, width=2))
         plot_widget = self.plot_widgets.get(parameter_name)
         if plot_widget is not None:
             plot_widget.setTitle(parameter_name, color=color, size='9pt')
