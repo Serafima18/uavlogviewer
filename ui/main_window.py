@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (QAction, QApplication, QComboBox, QDockWidget,
                              QFileDialog, QFormLayout, QHBoxLayout, QLabel,
                              QLineEdit, QMainWindow, QMessageBox, QProgressBar,
                              QPushButton, QStatusBar, QTextEdit, QToolBar,
-                             QVBoxLayout, QWidget, QColorDialog)
+                             QVBoxLayout, QWidget, QColorDialog, QSizePolicy)
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -52,13 +52,22 @@ class MainWindow(QMainWindow):
         self.setWindowTitle('UAVLogViewer')
         self.setGeometry(100, 100, 1600, 900)
 
-        # Центральная область — график занимает основное пространство окна.
         central_widget = QWidget()
+
+        central_widget.setMinimumWidth(0)
+        central_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+
         self.setCentralWidget(central_widget)
+
         main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
 
         # Виджет графиков.
         self.plot_widget = PlotWidget()
+
+        self.plot_widget.setMinimumWidth(0)
+        self.plot_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+
         self.plot_widget.time_type_changed.connect(self.on_time_type_changed)
         self.plot_widget.cursor_position_changed.connect(self.on_cursor_position_changed)
         self.plot_widget.active_plot_changed.connect(self.on_active_plot_changed)
@@ -71,10 +80,15 @@ class MainWindow(QMainWindow):
         self.setDockNestingEnabled(True)
         self.setDockOptions(QMainWindow.AllowNestedDocks | QMainWindow.AllowTabbedDocks)
 
+        self.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
+
         # Боковые/нижние панели.
         self.create_parameter_dock()
         self.create_cursor_info_dock()
         self.create_export_dock()
+
+        self.resizeDocks([self.cursor_info_dock], [200], Qt.Vertical)
+        self.resizeDocks([self.parameter_dock], [300], Qt.Horizontal)
 
         # Статусная строка и индикатор загрузки.
         self.status_bar = QStatusBar()
@@ -102,7 +116,13 @@ class MainWindow(QMainWindow):
         dock_widget.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         dock_widget.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
 
+        self.parameter_dock = dock_widget
+
         self.tree_widget = ParameterTreeWidget()
+
+        self.tree_widget.setMinimumWidth(0)
+        self.tree_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+
         self.tree_widget.parameter_toggled.connect(self.on_parameter_toggled)
         self.tree_widget.color_changed.connect(self.on_color_changed)
 
@@ -112,13 +132,24 @@ class MainWindow(QMainWindow):
     def create_cursor_info_dock(self):
         """Создаёт нижнюю панель с информацией о точке под курсором."""
         info_dock = QDockWidget('Информация о точке', self)
-        info_dock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea)
+        info_dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+
+        self.cursor_info_dock = info_dock
+
+        info_dock.setFeatures(
+            QDockWidget.DockWidgetClosable |
+            QDockWidget.DockWidgetMovable |
+            QDockWidget.DockWidgetFloatable
+        )
 
         self.cursor_info_text = QTextEdit()
         self.cursor_info_text.setReadOnly(True)
-        self.cursor_info_text.setMaximumHeight(170)
         self.cursor_info_text.setStyleSheet('font-family: monospace;')
 
+        self.cursor_info_text.setMinimumHeight(0)
+        self.cursor_info_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        info_dock.setMinimumHeight(0)
         info_dock.setWidget(self.cursor_info_text)
         self.addDockWidget(Qt.BottomDockWidgetArea, info_dock)
 
@@ -250,9 +281,25 @@ class MainWindow(QMainWindow):
         # Меню «Вид».
         view_menu = menubar.addMenu('Вид')
 
+        # Вариант 1 — параметры MAVLink справа на всю высоту
+        parameters_corner_action = view_menu.addAction("Правый нижний угол: Параметры MAVLink")
+
+        parameters_corner_action.triggered.connect(lambda: self.set_dock_corner_mode("parameters"))
+
+        # Вариант 2 — информация о точке занимает низ
+        info_corner_action = view_menu.addAction("Правый нижний угол: Информация о точке")
+
+        info_corner_action.triggered.connect(lambda: self.set_dock_corner_mode("info"))
+
         reset_all_action = QAction('Сбросить масштаб всех графиков', self)
         reset_all_action.triggered.connect(self.plot_widget.reset_all_plots)
         view_menu.addAction(reset_all_action)
+
+        cursor_info_action = self.cursor_info_dock.toggleViewAction()
+
+        cursor_info_action.setText('Показать панель информации о точке')
+
+        view_menu.addAction(cursor_info_action)
 
         reset_active_action = QAction('Сбросить масштаб активного графика', self)
         reset_active_action.triggered.connect(self.plot_widget.reset_active_plot)
@@ -501,7 +548,9 @@ class MainWindow(QMainWindow):
             current_time_type = self.plot_widget.time_type_combo.currentText()
             self.plot_widget.time_type_combo.clear()
             self.plot_widget.time_type_combo.addItems(time_types)
-            self.plot_widget.set_time_offset(getattr(self.processor, 'time_offset', 0.0))
+            self.plot_widget.set_time_offset(
+                getattr(self.processor, 'time_offset', None) or 0.0
+            )
 
             # По возможности сохраняем предыдущий выбранный тип времени.
             if current_time_type in time_types:
@@ -543,7 +592,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, 'Предупреждение', 'Сначала откройте файл лога')
             return False
 
-        x_data, y_data = self.processor.get_parameter_data(parameter_name, 'TimeUS')
+        time_type = self.plot_widget.time_type_combo.currentText()
+
+        x_data, y_data = self.processor.get_parameter_data(parameter_name, time_type)
 
         if x_data is not None and y_data is not None and len(x_data) > 0:
             success = self.plot_widget.add_plot(parameter_name, x_data, y_data, color)
@@ -559,11 +610,14 @@ class MainWindow(QMainWindow):
             if msg_type in stats:
                 available_times = stats[msg_type]['available_timestamps']
                 message = (
-                    f"Для параметра {parameter_name} нет данных с временем 'TimeUS'. "
+                    f"Для параметра {parameter_name} нет данных с временем '{time_type}'. "
                     f"Доступные типы времени: {', '.join(available_times)}"
                 )
             else:
-                message = f"Для параметра {parameter_name} нет данных с временем 'TimeUS'"
+                message = (
+                    f"Для параметра {parameter_name} "
+                    f"нет данных с временем '{time_type}'"
+                )
 
             QMessageBox.warning(self, 'Данные недоступны', message)
             if parameter_name in self.tree_widget.parameter_checkboxes:
@@ -602,11 +656,22 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage('Все графики очищены')
 
     def on_time_type_changed(self, time_type):
-        """Обрабатывает смену типа времени на панели графиков."""
-        if self.processor is None or not self.current_plots:
+        self.current_time_type = time_type
+        if self.processor is None:
             return
 
-        self.current_time_type = time_type
+        old_plots = [
+            (name, value[2])
+            for name, value in self.current_plots.items()
+        ]
+        if old_plots:
+            self.plot_widget.clear_all_plots()
+            self.current_plots.clear()
+            for name, color in old_plots:
+                x, y = self.processor.get_parameter_data(name, time_type)
+                if x is not None and len(x):
+                    if self.plot_widget.add_plot(name, x, y, color):
+                        self.current_plots[name] = (x, y, color)
         self.plot_widget.update_gps_date_label()
 
     def on_cursor_position_changed(self, x_pos, parameter_values):
@@ -614,16 +679,24 @@ class MainWindow(QMainWindow):
         self.last_cursor_time = x_pos
 
         if not parameter_values:
-            self.cursor_info_text.setText('Нет данных для отображения')
             return
 
-        offset = self.processor.time_offset if self.processor else 0.0
+        offset = self.processor.time_offset if self.processor else None
 
         def to_dt(ts):
-            """Конвертирует TimeUS-секунды в GPS datetime с учётом найденного смещения."""
+            if self.plot_widget.time_type_combo.currentText() == 'GPS':
+                gps_seconds = ts
+            elif offset is not None:
+                gps_seconds = ts + offset
+            else:
+                return None
+
             try:
-                return datetime.fromtimestamp(ts + offset, tz=timezone.utc)
-            except Exception:
+                return datetime.fromtimestamp(
+                    gps_seconds,
+                    tz=timezone.utc
+                )
+            except (ValueError, OverflowError, OSError):
                 return None
 
         dt_gps = to_dt(x_pos)
@@ -667,7 +740,14 @@ class MainWindow(QMainWindow):
                 f'(TimeUS: {data["x"]:.3f} сек)'
             )
 
-        self.cursor_info_text.setText('\n'.join(info_lines))
+        scrollbar = self.cursor_info_text.verticalScrollBar()
+        old_position = scrollbar.value()
+        new_text = '\n'.join(info_lines)
+        if self.cursor_info_text.toPlainText() != new_text:
+            self.cursor_info_text.setPlainText(new_text)
+            scrollbar.setValue(
+                min(old_position, scrollbar.maximum())
+            )
 
     def on_active_plot_changed(self, parameter_name):
         """Обновляет элементы интерфейса при смене активного графика."""
@@ -811,6 +891,12 @@ class MainWindow(QMainWindow):
             self.parse_thread.wait()
         event.accept()
 
+    def set_dock_corner_mode(self, mode): # Изменение нижнего угла
+        if mode == "parameters":
+            self.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
+
+        elif mode == "info":
+            self.setCorner(Qt.BottomRightCorner, Qt.BottomDockWidgetArea)
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

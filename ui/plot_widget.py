@@ -38,11 +38,10 @@ class TimeAxis(pg.AxisItem):
     def tickStrings(self, values, scale, spacing):
         """Возвращает подписи делений оси."""
         if self._get_time_type() == 'GPS' and not self._has_custom_x_transform():
-            offset = self._get_time_offset() or 0.0
             labels = []
             for value in values:
                 try:
-                    dt = datetime.fromtimestamp(value + offset, tz=timezone.utc)
+                    dt = datetime.fromtimestamp(value, tz=timezone.utc)
                     labels.append(dt.strftime('%H:%M:%S'))
                 except Exception:
                     labels.append('')
@@ -1831,7 +1830,7 @@ class PlotWidget(QWidget):
         x_center = (x_range[0] + x_range[1]) / 2.0
 
         try:
-            dt = datetime.fromtimestamp(x_center + (self.time_offset or 0.0), tz=timezone.utc)
+            dt = datetime.fromtimestamp(x_center, tz=timezone.utc)
             self.gps_date_label.setText(f'Дата GPS: {dt.strftime("%Y-%m-%d")}')
         except Exception:
             self.gps_date_label.setText('')

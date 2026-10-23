@@ -14,41 +14,71 @@ class LogProcessor:
         self.logfile_path: str = logfile_path
         self.message_data: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         self.message_descriptions: Dict[str, str] = self._load_message_descriptions()
-        self.time_offset: float = 0.0
+        self.time_offset: Optional[float] = None
 
     def parse_log(self):
-        """Парсинг MAVLink-лога и сохранение сообщений во внутреннюю структуру."""
+
+        self.message_data.clear()
+        self.time_offset = None
+
         mav = mavutil.mavlink_connection(self.logfile_path, input='bin')
+        last_boot_time = None
+        gps_pairs = []
 
-        # Смещения TimeUS -> GPS собираются из сообщений, где есть оба типа времени.
-        offsets = []
+        try:
+            while True:
+                msg = mav.recv_match()
+                if msg is None:
+                    break
 
-        while True:
-            msg = mav.recv_match()
-            if msg is None:
-                break
+                msg_type = msg.get_type()
+                if msg_type == 'BAD_DATA':
+                    continue
 
-            msg_type = msg.get_type()
-            timestamps = self._get_timestamps(msg)
+                timestamps = self._get_timestamps(msg)
+                boot = timestamps.get('TimeUS')
 
-            # Если сообщение содержит и TimeUS, и GPS-поля, используем его для расчёта смещения.
-            if hasattr(msg, 'TimeUS') and hasattr(msg, 'GMS') and hasattr(msg, 'GWk'):
-                gps_time = self._gps_to_seconds(msg.GWk, msg.GMS)
-                if gps_time > 0:
-                    timeus_seconds = msg.TimeUS / 1e6
-                    offsets.append(gps_time - timeus_seconds)
+                if boot is not None:
+                    last_boot_time = boot
 
-            # Храним временные метки отдельно от полезных полей сообщения.
-            message_record = {
-                'timestamp': timestamps,
-                'data': self._message_to_dict(msg),
-            }
-            self.message_data[msg_type].append(message_record)
+                gps = timestamps.get('GPS')
 
-        # После парсинга добавляем GPS-время туда, где есть только TimeUS.
-        if offsets:
-            self.time_offset = float(np.mean(offsets))
-            self._timeus_to_gps()
+                if gps is not None and boot is None and last_boot_time is not None:
+                    boot = last_boot_time
+                    timestamps['TimeUS'] = boot
+                    timestamps['TimeUS_raw'] = int(round(boot * 1_000_000))
+
+                if gps is not None and boot is not None:
+                    gps_pairs.append(gps - boot)
+
+                self.message_data[msg_type].append({
+                    'timestamp': timestamps,
+                    'data': self._message_to_dict(msg),
+                })
+        finally:
+            mav.close()
+
+        if gps_pairs:
+            offsets = np.asarray(gps_pairs, dtype=float)
+            center = float(np.median(offsets))
+            inliers = offsets[np.abs(offsets - center) < 10.0]
+
+            if len(inliers):
+                self.time_offset = float(np.median(inliers))
+
+                for records in self.message_data.values():
+                    for record in records:
+                        ts = record['timestamp']
+
+                        if 'TimeUS' in ts and 'GPS' not in ts:
+                            ts['GPS'] = ts['TimeUS'] + self.time_offset
+
+            print(
+                f'Синхронизация GPS/TimeUS: {len(gps_pairs)} точек, '
+                f'смещение {self.time_offset} сек'
+            )
+        else:
+            print('Синхронизация GPS/TimeUS недоступна')
 
     def _get_timestamps(self, msg):
         """Извлекает доступные временные метки из MAVLink-сообщения."""
@@ -56,27 +86,75 @@ class LogProcessor:
 
         # TimeUS храним в секундах для отображения и отдельно в raw-микросекундах для CSV.
         if hasattr(msg, 'TimeUS'):
-            timestamps['TimeUS'] = msg.TimeUS / 1e6
+            timestamps['TimeUS'] = msg.TimeUS / 1_000_000.0
             timestamps['TimeUS_raw'] = int(msg.TimeUS)
 
-        # TimeUS храним в миллисекундах
-        elif hasattr(msg, 'TimeMS'):
+        elif hasattr(msg, 'TimeMS') and msg.get_type() != 'GPS':
             timestamps['TimeUS'] = msg.TimeMS / 1000.0
             timestamps['TimeUS_raw'] = int(msg.TimeMS * 1000)
 
         # GPS-время в логе задано через GPS week + milliseconds.
-        if hasattr(msg, 'GMS') and hasattr(msg, 'GWk'):
-            gps_time = self._gps_to_seconds(msg.GWk, msg.GMS)
-            timestamps['GPS'] = gps_time
+        if hasattr(msg, 'GWk') and hasattr(msg, 'GMS'):
+            gps_week = msg.GWk
+            gps_ms = msg.GMS
+
+        elif msg.get_type() == 'GPS' and hasattr(msg, 'Week') and hasattr(msg, 'TimeMS'):
+            gps_week = msg.Week
+            gps_ms = msg.TimeMS
+
+        else:
+            gps_week = None
+            gps_ms = None
+
+        if gps_week is not None and gps_ms is not None:
+            gps_time = self._gps_to_seconds(gps_week, gps_ms)
+
+            if gps_time > 0:
+                timestamps['GPS'] = gps_time
 
         return timestamps
 
     def _gps_to_seconds(self, gps_week, gps_ms):
         """Конвертирует GPS-неделю и миллисекунды в секунды от Unix-эпохи."""
+        from datetime import datetime, timezone
+
         gps_epoch = 315964800
         seconds_per_week = 604800
-        return gps_epoch + (gps_week * seconds_per_week) + (gps_ms / 1000.0)
 
+        if gps_week <= 0 or not (0 <= gps_ms < seconds_per_week * 1000):
+            return 0.0
+
+        gps_seconds = (
+            gps_epoch
+            + gps_week * seconds_per_week
+            + gps_ms / 1000.0
+        )
+        leap_dates = (
+            (2017, 1, 1, 18),
+            (2015, 7, 1, 17),
+            (2012, 7, 1, 16),
+            (2009, 1, 1, 15),
+            (2006, 1, 1, 14),
+            (1999, 1, 1, 13),
+            (1997, 7, 1, 12),
+            (1996, 1, 1, 11),
+            (1994, 7, 1, 10),
+            (1993, 7, 1, 9),
+            (1992, 7, 1, 8),
+            (1991, 1, 1, 7),
+            (1990, 1, 1, 6),
+            (1988, 1, 1, 5),
+            (1985, 7, 1, 4),
+            (1983, 7, 1, 3),
+            (1982, 7, 1, 2),
+            (1981, 7, 1, 1),
+        )
+        for year, month, day, offset in leap_dates:
+            utc_boundary = datetime(year, month, day, tzinfo=timezone.utc).timestamp()
+            if gps_seconds >= utc_boundary + offset:
+                return gps_seconds - offset
+        return gps_seconds
+    
     def _timeus_to_gps(self):
         """Добавляет GPS-время сообщениям, у которых есть TimeUS, но нет GPS."""
         for messages in self.message_data.values():
@@ -89,8 +167,13 @@ class LogProcessor:
         """Преобразует MAVLink-сообщение в словарь без временных полей."""
         result = {}
         for field in msg.get_fieldnames():
-            if field not in ['TimeUS', 'TimeMS', 'GMS', 'GWk']:
+            if field not in ['TimeUS', 'TimeMS']:
                 result[field] = getattr(msg, field, None)
+        if msg.get_type() == 'GPS':
+            if 'Week' in result and 'GWk' not in result:
+                result['GWk'] = result['Week']
+            if hasattr(msg, 'TimeMS') and 'GMS' not in result:
+                result['GMS'] = msg.TimeMS
         return result
 
     def _load_message_descriptions(self):
@@ -111,7 +194,7 @@ class LogProcessor:
     def get_parameter_data(self, parameter_name, time_type='TimeUS'):
         """
         Возвращает массивы X/Y для параметра вида 'MSG_TYPE.FIELD_NAME'.
-        X берётся из выбранного типа времени, иначе первый доступный вариант из TimeUS/GPS.
+        X берётся только из выбранного типа времени; записи без него пропускаются.
         """
         try:
             msg_type, field_name = parameter_name.split('.', 1)
@@ -122,26 +205,29 @@ class LogProcessor:
             y_data = []
 
             for message_record in self.message_data[msg_type]:
-                # Значение параметра
                 field_value = message_record['data'].get(field_name)
                 if field_value is None:
                     continue
-
-                # Временная метка для оси X
+                if parameter_name in ('GPS.Week', 'GPS.GWk') and field_value == 0:
+                    continue
                 timestamp = message_record['timestamp'].get(time_type)
                 if timestamp is None:
-                    for alt_time_type in ['TimeUS', 'GPS']:
-                        timestamp = message_record['timestamp'].get(alt_time_type)
-                        if timestamp is not None:
-                            break
-
-                if timestamp is not None:
-                    x_data.append(timestamp)
-                    y_data.append(field_value)
+                    continue
+                x_data.append(timestamp)
+                y_data.append(field_value)
 
             if not x_data:
                 return None, None
 
+            if parameter_name == 'GPS.Week':
+                print('GPS.Week — первые 10 точек:')
+                for x, y in list(zip(x_data, y_data))[:10]:
+                    print(f'TimeUS = {x:.3f}, Week = {y}')
+
+                print('GPS.Week — уникальные значения:')
+                print(np.unique(y_data))
+
+            
             return np.array(x_data), np.array(y_data)
 
         except Exception as e:
